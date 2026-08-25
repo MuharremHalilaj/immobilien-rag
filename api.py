@@ -19,12 +19,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.staticfiles import StaticFiles
-from llama_index.readers.file import PDFReader
 from pydantic import BaseModel, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 import extraktion
+from pdf_lader import OCRFallbackPDFReader
 from main import DATA_DIR, baue_index, beantworte_frage, kennzahlen_backfill, _bekannte_objektnamen
 
 # Wird beim Start einmal befüllt (siehe lifespan unten), damit der Index
@@ -210,7 +210,7 @@ async def dokumente_hochladen(
     gelöscht statt als Datenmüll liegen zu bleiben.
     """
     objekt_slug = _slug(objekt_name)
-    pdf_reader = PDFReader()
+    pdf_reader = OCRFallbackPDFReader()
     ergebnisse = []
     mindestens_eine_erfolgreich = False
 

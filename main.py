@@ -38,6 +38,7 @@ from llama_index.vector_stores.postgres import PGVectorStore
 import extraktion
 import protokoll
 from db import verbindungsparameter as _pg_verbindungsparameter
+from pdf_lader import OCRFallbackPDFReader
 
 # API-Key aus .env laden (siehe .env-Datei, nicht in Git)
 load_dotenv()
@@ -71,6 +72,15 @@ PG_EMBED_DIM = 1536
 # Chunk-Zahl kalibriert (siehe Kommentar bei der Zuweisung weiter unten).
 SIMILARITY_TOP_K = 12
 
+# Für Fragen, die auf genau ein Objekt gefiltert sind (siehe
+# beantworte_frage): breiter abrufen + immer per LLM neu ranken, weil
+# reale Objekte mit vielen Dokumenten (Grundbuchauszüge, Protokolle,
+# Teilungserklärungen ...) dieselbe Adresse in fast jedem Chunk
+# wiederholen und einzelne Fakten sonst untergehen -- siehe Kommentar
+# bei beantworte_frage() und docs/testergebnisse.md.
+SIMILARITY_TOP_K_OBJEKT_GEFILTERT = 60
+RERANK_TOP_N_OBJEKT_GEFILTERT = 8
+
 # Optionales Reranking: holt wie bisher SIMILARITY_TOP_K Chunks per
 # Vektor-Ähnlichkeit, lässt sie danach zusätzlich vom LLM nach
 # tatsächlicher Relevanz zur Frage neu bewerten und behält nur die
@@ -102,6 +112,13 @@ QA_PROMPT = PromptTemplate(
     "andere Quelle einen abweichenden Wert zum inhaltlich selben Punkt "
     "nennt — auch wenn die Bezeichnung nicht identisch ist — und behandle "
     "das wie einen Widerspruch.\n"
+    "- Vorsicht bei Verwechslungen: Urkundenrollennummern (z. B. 'UR-Nr. "
+    "884/1998'), Aktenzeichen, Bescheinigungsnummern, Grundbuchblatt-"
+    "Bezeichnungen und Beurkundungs-/Änderungs-/Freigabedaten sind KEINE "
+    "Baujahre, Kaufpreise oder sonstigen Kennzahlen, auch wenn eine "
+    "Zahl darin wie ein Jahr oder Betrag aussieht — behandle sie nicht "
+    "als abweichenden Wert zum selben Sachverhalt, nur weil beide "
+    "Zahlen enthalten.\n"
     "- Wenn die Information nicht im Kontext enthalten ist, sage das "
     "ausdrücklich, anstatt zu raten oder Informationen zu erfinden.\n"
     "Frage: {query_str}\n"
@@ -188,18 +205,44 @@ def _bekannte_objektnamen() -> list[str]:
         conn.close()
 
 
+def _normalisiere_fuer_erkennung(text: str) -> str:
+    """
+    Gleiche Normalisierung wie _slug() in api.py (ß->ss, äöü->aou),
+    damit z.B. "Stadelmannstraße" in einer Frage mit dem Slug-Bestandteil
+    "stadelmannstrasse" übereinstimmt.
+    """
+    ersetzungen = str.maketrans("äöü", "aou")
+    return text.lower().replace("ß", "ss").translate(ersetzungen)
+
+
 def _erkenne_objekt(frage: str, bekannte_objekte: list[str]) -> str | None:
     """
-    Prüft, ob die Frage genau einen bekannten Objektnamen enthält (z.B.
-    "gartenhof" in "Gibt es einen Fahrstuhl in der Wohnung Gartenhof?").
-    Bei genau einem Treffer wird dieser für eine gezielte
-    Metadaten-Filterung zurückgegeben. Bei keinem Treffer (allgemeine
-    Frage) oder mehreren Treffern (z.B. Vergleichsfragen über mehrere
-    Objekte) wird None zurückgegeben — dann sucht beantworte_frage()
-    ungefiltert über den ganzen Corpus, wie bisher.
+    Prüft, ob die Frage genau einen bekannten Objektnamen enthält. Bei
+    genau einem Treffer wird dieser für eine gezielte Metadaten-Filterung
+    zurückgegeben. Bei keinem Treffer (allgemeine Frage) oder mehreren
+    Treffern (z.B. Vergleichsfragen über mehrere Objekte) wird None
+    zurückgegeben — dann sucht beantworte_frage() ungefiltert über den
+    ganzen Corpus, wie bisher.
+
+    Objektnamen aus einem Wort (unser synthetischer Testcorpus, z.B.
+    "sonnenblick") müssen komplett in der Frage vorkommen. Mehrteilige
+    Objektnamen aus echten Adressen (z.B. "aschaffenburg-
+    stadelmannstrasse-15") würden mit einem exakten Volltreffer so gut
+    wie nie matchen, weil kaum jemand eine Frage im Slug-Wortlaut
+    inkl. Bindestrichen formuliert -- hier reicht ein Großteil der
+    Bestandteile (alle bis auf höchstens einen, z.B. eine ausgelassene
+    Hausnummer).
     """
-    frage_klein = frage.lower()
-    treffer = [name for name in bekannte_objekte if name in frage_klein]
+    frage_norm = _normalisiere_fuer_erkennung(frage)
+    treffer = []
+    for name in bekannte_objekte:
+        bestandteile = [
+            _normalisiere_fuer_erkennung(teil) for teil in name.split("-") if teil
+        ]
+        gefunden = sum(1 for teil in bestandteile if teil in frage_norm)
+        mindestanzahl = max(1, len(bestandteile) - 1)
+        if gefunden >= mindestanzahl:
+            treffer.append(name)
     return treffer[0] if len(treffer) == 1 else None
 
 
@@ -249,14 +292,35 @@ def beantworte_frage(
     urspruenglicher_callback_manager = Settings.callback_manager
     Settings.callback_manager = CallbackManager([token_zaehler])
     try:
-        node_postprocessors = []
-        if AKTIVIERE_RERANKING:
-            node_postprocessors.append(
-                LLMRerank(top_n=RERANK_TOP_N, llm=Settings.llm)
-            )
+        # Bei Filterung auf genau ein Objekt: viel breiter abrufen und
+        # per LLM neu ranken statt sich auf reine Embedding-Ähnlichkeit
+        # zu verlassen. Grund: Objekte mit vielen Dokumenten (bei
+        # unseren 3 echten Test-Objekten 57-188 statt der 5 Chunks je
+        # synthetischem Objekt) wiederholen dieselbe Adresse in fast
+        # jedem Chunk -- die Embedding-Ähnlichkeit einzelner Fakten wie
+        # "Baujahr 1950" unterscheidet sich davon kaum, wodurch der
+        # richtige Chunk selbst mit SIMILARITY_TOP_K=12 nicht unter die
+        # Top-Treffer kam (gemessen: Rang 42 von 107). LLMRerank holt
+        # ihn zuverlässig auf Platz 1 -- siehe docs/testergebnisse.md.
+        # Für die ungefilterte, objektübergreifende Suche bleibt es
+        # beim bewusst schmaleren SIMILARITY_TOP_K/optionalen
+        # AKTIVIERE_RERANKING (siehe Kommentar oben, andere Kalibrierung
+        # für einen ganz anderen Anwendungsfall).
+        if filters is not None:
+            similarity_top_k = SIMILARITY_TOP_K_OBJEKT_GEFILTERT
+            node_postprocessors = [
+                LLMRerank(top_n=RERANK_TOP_N_OBJEKT_GEFILTERT, llm=Settings.llm)
+            ]
+        else:
+            similarity_top_k = SIMILARITY_TOP_K
+            node_postprocessors = []
+            if AKTIVIERE_RERANKING:
+                node_postprocessors.append(
+                    LLMRerank(top_n=RERANK_TOP_N, llm=Settings.llm)
+                )
 
         query_engine = index.as_query_engine(
-            similarity_top_k=SIMILARITY_TOP_K,
+            similarity_top_k=similarity_top_k,
             filters=filters,
             node_postprocessors=node_postprocessors,
         )
@@ -332,7 +396,9 @@ def baue_index() -> VectorStoreIndex:
         return VectorStoreIndex.from_vector_store(vector_store)
 
     dokumente = SimpleDirectoryReader(
-        DATA_DIR, file_metadata=_objekt_metadata
+        DATA_DIR,
+        file_metadata=_objekt_metadata,
+        file_extractor={".pdf": OCRFallbackPDFReader()},
     ).load_data()
     print(f"{len(dokumente)} Dokument(e) aus '{DATA_DIR}/' eingelesen.")
 
@@ -360,7 +426,9 @@ def kennzahlen_backfill() -> int:
     Gibt die Anzahl der verarbeiteten Dateien zurück.
     """
     dokumente = SimpleDirectoryReader(
-        DATA_DIR, file_metadata=_objekt_metadata
+        DATA_DIR,
+        file_metadata=_objekt_metadata,
+        file_extractor={".pdf": OCRFallbackPDFReader()},
     ).load_data()
     _extrahiere_kennzahlen_je_datei(dokumente)
     return len({doc.metadata.get("file_name", "unbekannt") for doc in dokumente})

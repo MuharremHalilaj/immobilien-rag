@@ -1,4 +1,5 @@
 .env
+data_pdf_real/
 storage/
 __pycache__/
 venv/

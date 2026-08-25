@@ -12,6 +12,8 @@ Widerspruch stillschweigend auflösen -- widerspricht der Grundidee
 dieses Projekts, Widersprüche zwischen Quellen sichtbar zu halten.
 """
 
+import re
+
 from pydantic import BaseModel, Field
 import psycopg2
 
@@ -23,15 +25,23 @@ TABELLE = "objekt_kennzahlen"
 
 EXTRAKTIONS_PROMPT = PromptTemplate(
     "Extrahiere die folgenden Kennzahlen aus diesem Auszug einer "
-    "Immobilien-Objektunterlage, falls jeweils im Text genannt. Lasse "
-    "ein Feld leer (null), wenn der Wert nicht im Text steht -- rate "
-    "nicht und übernimm keine Werte aus anderen Objekten.\n\n"
-    "Achtung bei 'baujahr': Das ist ausschließlich das Baujahr des "
-    "Gebäudes selbst. Ein Beurkundungsdatum, eine Urkundenrollennummer "
-    "(z.B. 'UR-Nr. 884/1998') oder das Datum einer Teilungserklärung "
-    "sind KEIN Baujahr, auch wenn eine Jahreszahl darin vorkommt -- nur "
-    "übernehmen, wenn der Text das Baujahr des Gebäudes explizit "
-    "nennt.\n\n{text}"
+    "Immobilien-Objektunterlage. Übernimm einen Wert NUR, wenn er im "
+    "Text unmittelbar neben einer eindeutigen Beschriftung steht, die "
+    "genau dieses Feld benennt (z.B. 'Baujahr: 1985', 'Kaufpreis: "
+    "310.000 EUR'). Lasse ein Feld leer (null), wenn kein so "
+    "beschrifteter Wert im Text steht -- rate nicht, leite nichts aus "
+    "dem Kontext ab und übernimm keine Werte aus anderen Objekten.\n\n"
+    "Immobilien-Objektunterlagen enthalten viele Zahlen, die wie ein "
+    "gesuchter Wert AUSSEHEN, es aber nicht sind: Urkundenrollennummern "
+    "(z.B. 'UR-Nr. 884/1998'), Grundbuchblatt-Bezeichnungen und "
+    "-Nummern, Aktenzeichen, Beurkundungs-/Änderungs-/Freigabedaten, "
+    "Rechnungs- oder Auftragsnummern, Kontostände oder Auftragssummen "
+    "aus Handwerker-/Dienstleistungsrechnungen. Eine vierstellige Zahl "
+    "ist nur dann ein Baujahr, ein Geldbetrag nur dann ein Kaufpreis, "
+    "wenn der Text das Wort 'Baujahr'/'erbaut'/'errichtet' bzw. "
+    "'Kaufpreis'/'Kaufsumme' direkt davor oder danach verwendet -- "
+    "niemals aus der Nähe zu einem Datum, einer Nummer oder einem "
+    "anderen Betrag im selben Absatz ableiten.\n\n{text}"
 )
 
 
@@ -73,6 +83,101 @@ def sicherstelle_tabelle() -> None:
         conn.close()
 
 
+# Felder mit einfacher Präsenzprüfung: der Wert muss irgendwo im Text
+# als Ziffernfolge auftauchen. Reicht für Felder, bei denen wir in der
+# Praxis keine Verwechslungsfälle gesehen haben.
+_PRUEFBARE_ZAHLENFELDER = {"wohnflaeche_qm", "zimmer", "hausgeld_eur_monatlich"}
+
+# Felder mit Label-Pflicht: hier reicht "Zahl kommt im Dokument vor"
+# nicht -- Objektunterlagen sind voll von Zahlen, die wie eine
+# Jahreszahl oder ein Geldbetrag aussehen, es aber nicht sind
+# (Urkundenrollennummern, Grundbuchblatt-Bezeichnungen,
+# Beurkundungsdaten, Auftragssummen, ...). Erst bestätigt, wenn eines
+# der Label-Wörter in der Nähe der Zahl im Text steht. Deckt sowohl
+# Verwechslungen (Zahl kommt vor, aber falsch interpretiert) als auch
+# reine Erfindungen (Zahl kommt gar nicht vor) ab -- beide Fälle traten
+# beim ersten Test mit echten Objektunterlagen auf, siehe
+# docs/testergebnisse.md.
+_LABELWOERTER = {
+    "baujahr": ("baujahr", "erbaut", "errichtet"),
+    "kaufpreis_eur": ("kaufpreis", "kaufsumme", "gesamtkaufpreis"),
+}
+# 80 statt z.B. 50 Zeichen, weil OCR bei tabellarischen Energieausweisen
+# die Lesereihenfolge von Wert und Label durcheinanderbringen kann
+# (siehe docs/testergebnisse.md, Mainz-Energieausweis: 57 Zeichen
+# Abstand zwischen "1980" und "Baujahr Gebäude").
+_LABEL_FENSTER = 80  # Zeichen vor/nach dem Zahlwert, in denen ein Label stehen muss
+
+
+def _kommt_im_text_vor(wert: float | int, text: str) -> bool:
+    ziffern_wert = str(int(wert))
+    ziffern_text = re.sub(r"[^0-9]", "", text)
+    return ziffern_wert in ziffern_text
+
+
+def _text_positionen(ziffern_wert: str, text: str) -> list[int]:
+    """
+    Fundstellen von ziffern_wert im Originaltext -- sowohl als
+    zusammenhängende Ziffernfolge als auch mit deutschen
+    Tausenderpunkten alle drei Stellen (z.B. "319458" -> auch
+    "319.458"), da Layout/OCR Tausendertrennzeichen unterschiedlich
+    setzen.
+    """
+    kandidaten = {ziffern_wert}
+    if len(ziffern_wert) > 3:
+        gruppen, rest = [], ziffern_wert
+        while len(rest) > 3:
+            gruppen.insert(0, rest[-3:])
+            rest = rest[:-3]
+        gruppen.insert(0, rest)
+        kandidaten.add(".".join(gruppen))
+
+    positionen = []
+    for kandidat in kandidaten:
+        start = 0
+        while (idx := text.find(kandidat, start)) != -1:
+            positionen.append(idx)
+            start = idx + 1
+    return positionen
+
+
+def _mit_label_belegt(wert: float | int, feld: str, text: str) -> bool:
+    ziffern_wert = str(int(wert))
+    text_klein = text.lower()
+    for idx in _text_positionen(ziffern_wert, text):
+        fenster = text_klein[
+            max(0, idx - _LABEL_FENSTER) : idx + len(ziffern_wert) + _LABEL_FENSTER
+        ]
+        if any(label in fenster for label in _LABELWOERTER[feld]):
+            return True
+    return False
+
+
+def _gegen_halluzination_absichern(
+    kennzahlen: "ObjektKennzahlen", dateiname: str, text: str
+) -> "ObjektKennzahlen":
+    for feld in _PRUEFBARE_ZAHLENFELDER:
+        wert = getattr(kennzahlen, feld)
+        if wert is not None and not _kommt_im_text_vor(wert, text):
+            print(
+                f"[Kennzahlen-Absicherung: '{feld}'={wert} für "
+                f"{dateiname} kommt im Quelltext nicht vor -- verworfen]"
+            )
+            setattr(kennzahlen, feld, None)
+
+    for feld in _LABELWOERTER:
+        wert = getattr(kennzahlen, feld)
+        if wert is not None and not _mit_label_belegt(wert, feld, text):
+            print(
+                f"[Kennzahlen-Absicherung: '{feld}'={wert} für "
+                f"{dateiname} steht in keiner Nähe zu "
+                f"{_LABELWOERTER[feld]} -- verworfen]"
+            )
+            setattr(kennzahlen, feld, None)
+
+    return kennzahlen
+
+
 def extrahiere_und_speichere(objekt_name: str, dateiname: str, text: str) -> None:
     """
     Läuft fehlertolerant: ein Problem bei der Extraktion (z.B. Timeout,
@@ -84,6 +189,7 @@ def extrahiere_und_speichere(objekt_name: str, dateiname: str, text: str) -> Non
         kennzahlen = Settings.llm.structured_predict(
             ObjektKennzahlen, EXTRAKTIONS_PROMPT, text=text
         )
+        kennzahlen = _gegen_halluzination_absichern(kennzahlen, dateiname, text)
     except Exception as fehler:
         print(f"[Kennzahlen-Extraktion fehlgeschlagen für {dateiname}: {fehler}]")
         return

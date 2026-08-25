@@ -11,6 +11,146 @@ Einträge.
 
 ---
 
+## Lauf vom 2026-08-26 — Erster Test mit echten Objektunterlagen: OCR, Halluzinations-Absicherung, Objekterkennung und Retrieval-Breite gefixt
+
+**Git-Commit:** noch nicht committet (Stand zum Zeitpunkt dieses Eintrags).
+
+**Auslöser:** Erster Test des Systems mit echten (nicht selbst erzeugten)
+Objektunterlagen zu 3 realen Objekten (Aschaffenburg Stadelmannstraße 15,
+Mainz Münsterstraße "AMC1", Bickenbach Ringstraße 43-45; 40 PDF-Dateien,
+285 Seiten) über die Produktions-Oberfläche. Ergebnis: Upload lief ohne
+Fehler durch, aber weder das Kennzahlen-Dashboard noch der Chatbot
+hatten irgendeine Information zu den neuen Objekten. Vier voneinander
+unabhängige Ursachen gefunden und behoben:
+
+### 1. Kein OCR-Fallback — 14 von 40 echten Dateien waren reine Scans
+
+`pypdf` (über `PDFReader`) liefert für eingescannte Seiten ohne
+Textebene stillschweigend einen leeren String statt eines Fehlers — u.a.
+betroffen: beide Energieausweise, die Teilungserklärung AMC1,
+Abgeschlossenheitsbescheinigungen. Fix: neuer `pdf_lader.py` mit
+`OCRFallbackPDFReader` (pymupdf zum Rendern, pytesseract mit deutschem
+Sprachpaket für OCR), greift automatisch pro Seite, wenn `pypdf`/pymupdf
+weniger als 20 Zeichen extrahiert. Ersetzt `PDFReader` sowohl in
+`api.py` (Upload) als auch in `main.py` (`SimpleDirectoryReader`
+`file_extractor`). `requirements.txt` (`pymupdf`, `pytesseract`) und
+`Dockerfile` (`tesseract-ocr`, `tesseract-ocr-deu` per `apt-get`) für
+Produktion ergänzt.
+
+### 2. Kennzahlen-Extraktion halluzinierte Werte, die im Text gar nicht vorkommen
+
+Direkter Textabgleich zeigte zwei Fehlerbilder: (a) reine Erfindung —
+z.B. `kaufpreis_eur=319458.03` aus einer Auftragsbestätigung, obwohl die
+Zahl an keiner Stelle im Dokument steht; (b) Verwechslung — z.B.
+`baujahr=1955` aus "Darmstadt Bickenbach **1955**" (einer
+Grundbuchblatt-Bezeichnung) oder `baujahr=1981` aus "Nr. 01 der
+Urkundenrolle für **1981**" — dasselbe Muster wie der früher dokumentierte
+Sonnenblick-Bug, nur dass der damalige Prompt-Fix zu eng gefasst war
+(nur "Urkundenrollennummer" explizit ausgeschlossen). Fix, zweistufig:
+- `EXTRAKTIONS_PROMPT` (`extraktion.py`) verlangt jetzt allgemein eine
+  eindeutige Beschriftung direkt neben dem Wert, nicht nur den
+  Ausschluss eines einzelnen bekannten Verwechslungsmusters.
+- Zusätzliches Code-Sicherheitsnetz `_gegen_halluzination_absichern()`:
+  für `baujahr`/`kaufpreis_eur` muss der Wert im Text nachweislich in
+  einem 80-Zeichen-Fenster neben einem Label-Wort stehen
+  (`baujahr`/`erbaut`/`errichtet` bzw.
+  `kaufpreis`/`kaufsumme`/`gesamtkaufpreis`), sonst wird das Feld auf
+  `null` zurückgesetzt und der Vorgang geloggt. Das 80-Zeichen-Fenster
+  (statt z.B. 50) wurde nötig, weil OCR bei tabellarischen
+  Energieausweisen Wert und Label in vertauschter Reihenfolge liest
+  (gemessener Abstand: 57 Zeichen zwischen "1980" und "Baujahr
+  Gebäude" im Mainz-Energieausweis). Ergebnis nach Fix: alle 3 real
+  ermittelten Baujahr-Werte (1950 Aschaffenburg, 1970 Bickenbach, 1980
+  Mainz) stehen nachweislich direkt neben "Baujahr Gebäude" im
+  jeweiligen Energieausweis; kein einziger Kaufpreis mehr im Datensatz
+  (keine der 40 echten Dateien nennt tatsächlich einen Kaufpreis).
+
+### 3. Objekterkennung (`_erkenne_objekt`) verlangte den kompletten Slug wortwörtlich
+
+Funktionierte nur für einwortige synthetische Objektnamen
+("sonnenblick"). Bei mehrteiligen echten Adress-Slugs
+("aschaffenburg-stadelmannstrasse-15") matcht praktisch keine natürlich
+formulierte Frage den kompletten Bindestrich-Slug — Fragen zu echten
+Objekten fielen auf die ungefilterte Suche über den gesamten Corpus
+zurück. Fix: `_erkenne_objekt` prüft jetzt pro Objekt-Slug seine
+einzelnen Bestandteile (Split an "-") und verlangt, dass mindestens
+alle bis auf einen Bestandteil in der (gleich normalisierten: ß→ss,
+äöü→aou) Frage vorkommen — deckt z.B. eine ausgelassene Hausnummer ab.
+Beide Seiten (Frage und Objekt-Bestandteile) müssen dieselbe
+Normalisierung durchlaufen; ein erster Versuch, nur die Frage zu
+normalisieren, brach die Erkennung des synthetischen Objekts
+"ahornhöhe" (Testfall 13), weil "ahornhöhe" (roh, mit ö) dann nicht mehr
+gegen die normalisierte Frage ("ahornhohe") matchte — im selben Schritt
+korrigiert.
+
+### 4. `SIMILARITY_TOP_K=12` reichte bei echten Objekten mit vielen Dokumenten nicht
+
+12 war spezifisch für den synthetischen Corpus kalibriert (8 Objekte, je
+~5 Chunks). Echte Objekte haben deutlich mehr Dokumente und Chunks (57
+für Bickenbach, 107 für Aschaffenburg, 188 für Mainz) — und wiederholen
+dieselbe Adresse in fast jedem Chunk, wodurch sich einzelne Fakten
+("Baujahr 1950") per reiner Embedding-Ähnlichkeit kaum von der Masse
+abheben. Gemessen: der richtige Baujahr-Chunk für Aschaffenburg landete
+bei `similarity_top_k=12` gar nicht und selbst bei 50 erst auf Rang 42
+von 107. Fix: bei Fragen mit erkanntem Objektfilter jetzt
+`similarity_top_k=60` plus verpflichtendes `LLMRerank` auf die 8
+relevantesten Chunks (`SIMILARITY_TOP_K_OBJEKT_GEFILTERT`,
+`RERANK_TOP_N_OBJEKT_GEFILTERT` in `main.py`) — gemessen: hebt den
+richtigen Chunk zuverlässig auf Rang 1. Betrifft ausdrücklich nur den
+gefilterten Einzelobjekt-Fall; die ungefilterte, objektübergreifende
+Suche bleibt unverändert bei `SIMILARITY_TOP_K=12` (siehe Lauf vom
+2026-08-06 unten — dort separat gemessen, dass Reranking dem
+ungefilterten Fall schadet).
+
+**Zusätzlich beim Fix entdeckt:** Der QA-Prompt für Chat-Antworten
+(nicht nur die strukturierte Extraktion) unterlag demselben
+Verwechslungsmuster — eine Testfrage nach dem Baujahr Aschaffenburg
+erzeugte einen erfundenen "Widerspruch" zwischen dem echten Baujahr
+(1950) und einer Bescheinigungsnummer ("536/1948 vom 09.10.1948") aus
+der Teilungserklärung. `QA_PROMPT` in `main.py` um denselben
+Verwechslungs-Hinweis ergänzt (Urkundenrollennummern,
+Bescheinigungsnummern, Grundbuchblatt-Bezeichnungen,
+Beurkundungsdaten sind keine abweichenden Werte zum selben
+Sachverhalt).
+
+### Verifikation
+
+Nach allen Fixes: Kennzahlen-Dashboard zeigt für alle 3 echten Objekte
+plausible, textlich belegte Werte; folgende Chat-Fragen (direkt gegen
+`beantworte_frage()`, herkunft="test") liefern korrekte, belegte
+Antworten:
+
+- *"Welches Baujahr hat das Gebäude in der Stadelmannstraße 15 in
+  Aschaffenburg?"* → 1950 (Energieausweis), mit korrekter Erkennung,
+  dass die Bescheinigungsnummer 536/1948 **kein** abweichendes Baujahr
+  ist.
+- *"Welches Baujahr hat das Objekt Ringstraße 43-45 in Bickenbach?"* →
+  1970 (Energieausweis).
+- *"Wie hoch ist das Hausgeld für die Wohnung in der Münsterstraße in
+  Mainz (AMC1)?"* → 402,00 €/Monat (Vorauszahlung), mit Aufschlüsselung
+  aus der Hausgeldabrechnung 2024.
+
+Vollständiger Testkatalog (`tests/testfragen.py`) danach erneut
+gelaufen: **12/13 bestanden.** Einziger Fehlschlag: Testfall 7
+(objektübergreifender Vergleich aller 8 synthetischen
+Energieausweise) — Ursache ist **kein Code-Bug**, sondern dass die 3
+echten Objekte testweise in dieselbe lokale Datenbank wie der
+synthetische Demo-Corpus geladen wurden. Die viel größeren echten
+Objekte (57-188 Chunks) verdrängen die synthetischen (je 5 Chunks) in
+der ungefilterten, für 8 kleine Objekte kalibrierten Cross-Objekt-Suche.
+Bestätigt die bereits zuvor gegebene Empfehlung, echte Objektdaten in
+Produktion getrennt vom Demo-Corpus zu halten (separate Tabelle o.ä.),
+statt beides zu vermischen — noch nicht umgesetzt, offener
+Folgeschritt.
+
+**Nebenbefund (keine Code-Änderung):** Beim erneuten Extrahieren fiel
+`wohnflaeche_qm`/`zimmer` für eine Datei zwischen zwei Läufen
+unterschiedlich aus (mal gefüllt, mal leer) — bekanntes
+LLM-Nichtdeterminismus-Phänomen (Temperatur nicht auf 0 gepinnt, siehe
+bereits dokumentierte Testfall-12-Flakiness), keine neue Ursache.
+
+---
+
 ## Lauf vom 2026-08-06 06:38 (CEST) — Reranking objektiv gemessen: hilft hier nicht, bleibt standardmäßig aus
 
 **Git-Commit:** `c187ea801ffaabe620fe9a954575ba938ca586c5` ("Retrieval-Qualität:
