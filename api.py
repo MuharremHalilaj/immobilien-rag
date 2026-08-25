@@ -20,6 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -186,6 +187,37 @@ class UploadResponse(BaseModel):
     hochgeladen: list[UploadErgebnis]
 
 
+def _datei_verarbeiten(
+    zielpfad: Path, inhalt: bytes, objekt_slug: str, original_dateiname: str
+) -> UploadErgebnis:
+    """
+    Der eigentlich teure Teil pro Datei (OCR-Fallback beim Lesen,
+    Embedding beim Index-Insert, LLM-Aufruf bei der Kennzahlen-
+    Extraktion) — synchron, damit er über run_in_threadpool() aus der
+    async-Route ausgelagert werden kann (siehe dokumente_hochladen).
+    """
+    zielpfad.write_bytes(inhalt)
+
+    try:
+        seiten = OCRFallbackPDFReader().load_data(zielpfad)
+    except Exception:
+        zielpfad.unlink(missing_ok=True)
+        return UploadErgebnis(
+            dateiname=original_dateiname,
+            fehler="Datei konnte nicht als PDF gelesen werden (beschädigt oder kein gültiges PDF).",
+        )
+
+    for seite in seiten:
+        seite.metadata["objekt_name"] = objekt_slug
+        seite.metadata["file_name"] = zielpfad.name
+        zustand["index"].insert(seite)
+
+    voller_text = "\n".join(seite.text for seite in seiten)
+    extraktion.extrahiere_und_speichere(objekt_slug, zielpfad.name, voller_text)
+
+    return UploadErgebnis(dateiname=zielpfad.name, seiten=len(seiten))
+
+
 @app.post("/api/upload")
 async def dokumente_hochladen(
     objekt_name: str = Form(...), dateien: list[UploadFile] = File(...)
@@ -208,9 +240,18 @@ async def dokumente_hochladen(
     Ergebnis markiert (fehler-Feld), die übrigen Dateien werden normal
     verarbeitet, und die bereits geschriebene Datei wird wieder
     gelöscht statt als Datenmüll liegen zu bleiben.
+
+    Die eigentliche Verarbeitung pro Datei läuft über run_in_threadpool
+    in einem Worker-Thread, nicht direkt im async-Handler: OCR
+    (pytesseract) ist reine, blockierende CPU-Arbeit, die bei einem
+    direkten Aufruf hier die komplette Event-Loop anhält -- damit wäre
+    der Server für ALLE Nutzer eingefroren, solange nur eine einzige
+    eingescannte Datei verarbeitet wird, nicht nur für den Hochladenden
+    (beobachtet beim ersten Produktions-Upload eines eingescannten
+    Energieausweises: der komplette Dienst wurde für die Dauer der
+    OCR-Verarbeitung unerreichbar, siehe docs/testergebnisse.md).
     """
     objekt_slug = _slug(objekt_name)
-    pdf_reader = OCRFallbackPDFReader()
     ergebnisse = []
     mindestens_eine_erfolgreich = False
 
@@ -222,30 +263,16 @@ async def dokumente_hochladen(
             zielpfad = zielpfad.with_stem(f"{zielpfad.stem}_{int(time.time() * 1000)}")
 
         inhalt = await datei.read()
-        zielpfad.write_bytes(inhalt)
-
-        try:
-            seiten = pdf_reader.load_data(zielpfad)
-        except Exception:
-            zielpfad.unlink(missing_ok=True)
-            ergebnisse.append(
-                UploadErgebnis(
-                    dateiname=datei.filename or "unbekannt",
-                    fehler="Datei konnte nicht als PDF gelesen werden (beschädigt oder kein gültiges PDF).",
-                )
-            )
-            continue
-
-        for seite in seiten:
-            seite.metadata["objekt_name"] = objekt_slug
-            seite.metadata["file_name"] = zielpfad.name
-            zustand["index"].insert(seite)
-
-        voller_text = "\n".join(seite.text for seite in seiten)
-        extraktion.extrahiere_und_speichere(objekt_slug, zielpfad.name, voller_text)
-
-        ergebnisse.append(UploadErgebnis(dateiname=zielpfad.name, seiten=len(seiten)))
-        mindestens_eine_erfolgreich = True
+        ergebnis = await run_in_threadpool(
+            _datei_verarbeiten,
+            zielpfad,
+            inhalt,
+            objekt_slug,
+            datei.filename or "unbekannt",
+        )
+        ergebnisse.append(ergebnis)
+        if ergebnis.fehler is None:
+            mindestens_eine_erfolgreich = True
 
     if mindestens_eine_erfolgreich and objekt_slug not in zustand["bekannte_objekte"]:
         zustand["bekannte_objekte"].append(objekt_slug)

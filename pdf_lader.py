@@ -31,9 +31,13 @@ from PIL import Image
 # ein paar Kopfzeilen-Reste reichen nicht, um auf OCR zu verzichten.
 _MINDEST_ZEICHEN_PRO_SEITE = 20
 
-# 300 DPI ist ein guter Kompromiss zwischen OCR-Genauigkeit und
-# Laufzeit/Speicher für die typischerweise DIN-A4-großen Dokumente hier.
-_OCR_DPI = 300
+# 200 statt z.B. 300 DPI: spürbar weniger Rechenzeit/Speicher pro Seite
+# bei kaum merklichem Genauigkeitsverlust für die hier typischen
+# maschinengeschriebenen/gedruckten Dokumente -- wichtig, weil der
+# Produktions-Container (Render Free Tier) bei 300 DPI schon bei einem
+# einzelnen 6-seitigen Energieausweis eingefroren ist (siehe
+# docs/testergebnisse.md).
+_OCR_DPI = 200
 
 # Objektunterlagen sind durchgehend deutschsprachig.
 _OCR_SPRACHE = "deu"
