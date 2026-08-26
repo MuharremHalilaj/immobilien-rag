@@ -31,13 +31,14 @@ from PIL import Image
 # ein paar Kopfzeilen-Reste reichen nicht, um auf OCR zu verzichten.
 _MINDEST_ZEICHEN_PRO_SEITE = 20
 
-# 200 statt z.B. 300 DPI: spürbar weniger Rechenzeit/Speicher pro Seite
+# 150 statt z.B. 300 DPI: spürbar weniger Rechenzeit/Speicher pro Seite
 # bei kaum merklichem Genauigkeitsverlust für die hier typischen
 # maschinengeschriebenen/gedruckten Dokumente -- wichtig, weil der
 # Produktions-Container (Render Free Tier) bei 300 DPI schon bei einem
-# einzelnen 6-seitigen Energieausweis eingefroren ist (siehe
+# einzelnen 6-seitigen Energieausweis eingefroren ist und bei 200 DPI
+# laut Render-Meldung immer noch das RAM-Limit überschritten hat (siehe
 # docs/testergebnisse.md).
-_OCR_DPI = 200
+_OCR_DPI = 150
 
 # Objektunterlagen sind durchgehend deutschsprachig.
 _OCR_SPRACHE = "deu"
@@ -73,7 +74,11 @@ class OCRFallbackPDFReader(BaseReader):
 
     def _ocr_seite(self, seite, pfad: Path, seiten_index: int) -> str:
         try:
-            pix = seite.get_pixmap(dpi=_OCR_DPI)
+            # Direkt als Graustufen rendern statt in Farbe und danach
+            # umzuwandeln -- Tesseract braucht ohnehin nur Helligkeitswerte,
+            # und ein Graustufen-Pixmap belegt von vornherein nur ein
+            # Drittel des Speichers eines RGB-Pixmaps in gleicher Auflösung.
+            pix = seite.get_pixmap(dpi=_OCR_DPI, colorspace=pymupdf.csGRAY)
             bild = Image.open(io.BytesIO(pix.tobytes("png")))
             return pytesseract.image_to_string(bild, lang=_OCR_SPRACHE)
         except Exception as fehler:
