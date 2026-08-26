@@ -11,9 +11,79 @@ Einträge.
 
 ---
 
+## Lauf vom 2026-08-26 (Fortsetzung) — Produktions-Upload der 3 echten Objekte: Render Free Tier zu ressourcenschwach für OCR
+
+**Git-Commit:** `39b6d70` ("Upload-Endpunkt: OCR blockiert nicht mehr den
+ganzen Server, DPI gesenkt").
+
+**Ziel:** Die 3 lokal bereits verifizierten echten Objekte (siehe Lauf
+oben) über denselben Weg wie ein echter Nutzer-Upload — also über die
+Produktions-Weboberfläche selbst, nicht per Direktzugriff auf die
+Datenbank — nach Render laden, damit exakt der Pfad getestet wird, der
+später für Bonorum/Vertriebspartner-Uploads genutzt würde.
+
+**Vorab gefundener und behobener Bug:** Der Upload-Endpunkt
+(`api.py: dokumente_hochladen`) rief die OCR-Verarbeitung
+(`pytesseract`, reine CPU-Arbeit) bisher direkt und blockierend
+innerhalb der `async def`-Route auf. Das hält die komplette
+uvicorn-Event-Loop an, solange eine Datei OCR braucht — nicht nur für
+den Hochladenden, sondern für **alle** gleichzeitigen Nutzer der Seite.
+Fix: die Verarbeitung pro Datei läuft jetzt über
+`starlette.concurrency.run_in_threadpool` in einem Worker-Thread.
+Zusätzlich OCR-Auflösung von 300 auf 200 DPI gesenkt (an der
+Aschaffenburg-Energieausweis-Testseite verifiziert: "Baujahr Gebäude
+1950" bleibt bei 200 DPI zuverlässig lesbar), um die Rechenlast pro
+Seite zu senken.
+
+**Test 1 — Threadpool-Fix funktioniert:** Ein Upload der 6-seitigen,
+komplett gescannten Energieausweis-Datei (Objekt Aschaffenburg) wurde
+im Hintergrund gestartet; parallel dazu wurde `/api/objekte` alle 8
+Sekunden abgefragt. Ergebnis: durchgehend `HTTP 200`, der Server blieb
+für andere Anfragen voll erreichbar, während die OCR-Verarbeitung lief
+— der Fix wirkt wie beabsichtigt.
+
+**Test 1 — aber trotzdem gescheitert:** Der Upload selbst kam nach 280
+Sekunden nicht durch (Client-Timeout, `curl` Exit-Code 28). Ein erneuter
+Versuch, den Fortschritt zu prüfen, führte kurz danach zu einem
+kompletten Ausfall des Dienstes: **~9 Minuten durchgehend `HTTP 000`**
+auf jede Anfrage, deutlich länger und ohne die Selbstheilung des ersten
+Einfrierens vor dem Threadpool-Fix (das erholte sich nach ~90s). Nach
+einer Pause war der Dienst von selbst wieder erreichbar (`HTTP 200`),
+aber ohne dass die Datei verarbeitet wurde — `/api/kennzahlen/
+aschaffenburg-stadelmannstrasse-15` blieb leer (`[]`), das Objekt wurde
+nicht einmal in `bekannte_objekte` aufgenommen. Kein Datenmüll, aber
+auch kein Ergebnis.
+
+**Einschätzung:** Der Threadpool-Fix behebt das reine
+Nebenläufigkeits-Problem (Server nicht mehr für alle blockiert), löst
+aber nicht das eigentliche Ressourcenproblem — der Render-Free-Tier-
+Container (typ. 512 MB RAM, stark gedrosselte CPU) scheint beim
+mehrseitigen OCR-Rendern (pymupdf-Pixmaps + pytesseract) an seine
+Speicher-/Rechengrenze zu stoßen und abzustürzen. Auf zwei
+unabhängigen Versuchen beobachtet, kein Einzelfall.
+
+**Entscheidung (mit User):** Kein weiteres Erzwingen über den
+Live-Upload-Endpunkt heute. Zwei Optionen für morgen besprochen, noch
+nicht entschieden:
+1. Die bereits lokal fertig verifizierten Daten (Text, Embeddings,
+   Kennzahlen — siehe Lauf oben) direkt in die Produktions-Postgres-DB
+   einspielen, ohne den Live-Server mit OCR zu belasten (braucht
+   Render-Postgres-Zugangsdaten vom User).
+2. Render-Plan-Upgrade (z.B. Starter-Tier) für dauerhaft belastbare
+   OCR-Uploads über die UI — relevant unabhängig von Option 1, da
+   Bonorum/Vertriebspartner künftig selbst PDFs hochladen sollen.
+
+**Offener Punkt für morgen:** Produktions-Upload der 3 echten Objekte
+noch nicht abgeschlossen. Code-Fixes (OCR, Halluzinations-Absicherung,
+Objekterkennung, Retrieval-Breite, Threadpool) sind gepusht und in
+Produktion aktiv, nur die eigentlichen Objektdaten fehlen dort noch.
+
+---
+
 ## Lauf vom 2026-08-26 — Erster Test mit echten Objektunterlagen: OCR, Halluzinations-Absicherung, Objekterkennung und Retrieval-Breite gefixt
 
-**Git-Commit:** noch nicht committet (Stand zum Zeitpunkt dieses Eintrags).
+**Git-Commit:** `75e91a4` ("OCR-Fallback und Fixes für echte Objektunterlagen
+(Halluzination, Objekterkennung, Retrieval)").
 
 **Auslöser:** Erster Test des Systems mit echten (nicht selbst erzeugten)
 Objektunterlagen zu 3 realen Objekten (Aschaffenburg Stadelmannstraße 15,
