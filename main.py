@@ -37,6 +37,7 @@ from llama_index.vector_stores.postgres import PGVectorStore
 
 import extraktion
 import protokoll
+import zusammenfassung
 from db import verbindungsparameter as _pg_verbindungsparameter
 from pdf_lader import OCRFallbackPDFReader
 
@@ -388,6 +389,7 @@ def baue_index() -> VectorStoreIndex:
     """
     protokoll.sicherstelle_tabelle()
     extraktion.sicherstelle_tabelle()
+    zusammenfassung.sicherstelle_tabelle()
     vector_store = _baue_pgvector_store()
 
     anzahl = _anzahl_vorhandener_chunks()
@@ -410,7 +412,26 @@ def baue_index() -> VectorStoreIndex:
 
     _extrahiere_kennzahlen_je_datei(dokumente)
 
+    objekt_namen = {doc.metadata.get("objekt_name", "unbekannt") for doc in dokumente}
+    print(f"Erzeuge Objekt-Zusammenfassungen für {len(objekt_namen)} Objekt(e) ...")
+    for objekt_name in objekt_namen:
+        zusammenfassung.erzeuge_und_speichere(objekt_name)
+
     return index
+
+
+def zusammenfassung_backfill() -> int:
+    """
+    Erzeugt/aktualisiert die Objekt-Zusammenfassung (zusammenfassung.py)
+    für alle aktuell bekannten Objekte, unabhängig davon, ob der
+    Vektor-Index gerade neu gebaut wurde. Für den Fall, dass Objekte schon
+    vor Einführung dieses Features hochgeladen wurden (z.B. über
+    api.py: POST /api/admin/zusammenfassung-backfill, Basic-Auth-geschützt).
+    """
+    bekannte_objekte = _bekannte_objektnamen()
+    for objekt_name in bekannte_objekte:
+        zusammenfassung.erzeuge_und_speichere(objekt_name)
+    return len(bekannte_objekte)
 
 
 def kennzahlen_backfill() -> int:

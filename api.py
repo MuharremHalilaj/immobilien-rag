@@ -17,7 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from starlette.concurrency import run_in_threadpool
@@ -25,8 +25,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 import extraktion
+import zusammenfassung
 from pdf_lader import OCRFallbackPDFReader
-from main import DATA_DIR, baue_index, beantworte_frage, kennzahlen_backfill, _bekannte_objektnamen
+from main import (
+    DATA_DIR,
+    baue_index,
+    beantworte_frage,
+    kennzahlen_backfill,
+    zusammenfassung_backfill,
+    _bekannte_objektnamen,
+)
 
 # Wird beim Start einmal befüllt (siehe lifespan unten), damit der Index
 # nicht bei jeder Anfrage neu geladen wird.
@@ -144,6 +152,36 @@ def kennzahlen_auflisten() -> list[dict]:
 @app.get("/api/kennzahlen/{objekt_name}")
 def kennzahlen_fuer_objekt(objekt_name: str) -> list[dict]:
     return extraktion.kennzahlen_fuer_objekt(objekt_name)
+
+
+@app.get("/api/zusammenfassung/{objekt_name}")
+def zusammenfassung_fuer_objekt(objekt_name: str) -> dict:
+    """
+    Objekt-Zusammenfassung (siehe zusammenfassung.py) -- über alle
+    Dokumente eines Objekts hinweg, im Gegensatz zu /api/kennzahlen/
+    (dort: pro Dokument). Wird nach jedem Upload neu erzeugt, hier nur
+    gelesen -- kein LLM-Call in dieser Route, damit die Detailansicht im
+    Dashboard sofort lädt.
+    """
+    eintrag = zusammenfassung.zusammenfassung_fuer_objekt(objekt_name)
+    if eintrag is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Noch keine Zusammenfassung für dieses Objekt vorhanden.",
+        )
+    return eintrag
+
+
+@app.post("/api/admin/zusammenfassung-backfill")
+def zusammenfassung_backfill_auslösen() -> dict:
+    """
+    Erzeugt/aktualisiert die Objekt-Zusammenfassung für alle bekannten
+    Objekte nachträglich -- für Objekte, die vor Einführung dieses
+    Features hochgeladen wurden. Wie kennzahlen_backfill_auslösen durch
+    die Basic-Auth-Middleware geschützt.
+    """
+    anzahl = zusammenfassung_backfill()
+    return {"verarbeitete_objekte": anzahl}
 
 
 @app.post("/api/admin/kennzahlen-backfill")
@@ -276,6 +314,12 @@ async def dokumente_hochladen(
 
     if mindestens_eine_erfolgreich and objekt_slug not in zustand["bekannte_objekte"]:
         zustand["bekannte_objekte"].append(objekt_slug)
+
+    if mindestens_eine_erfolgreich:
+        # Läuft über ALLE Dokumente des Objekts neu (nicht nur die gerade
+        # hochgeladenen), da die Zusammenfassung objektweit ist und ein
+        # neues Dokument z.B. bestehende offene_punkte auflösen kann.
+        await run_in_threadpool(zusammenfassung.erzeuge_und_speichere, objekt_slug)
 
     return UploadResponse(objekt=objekt_slug, hochgeladen=ergebnisse)
 

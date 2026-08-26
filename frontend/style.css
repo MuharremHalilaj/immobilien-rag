@@ -482,6 +482,16 @@ body {
   border-radius: 16px;
   box-shadow: var(--schatten);
   padding: 18px 20px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+  text-align: left;
+  font-family: inherit;
+  color: inherit;
+}
+
+.objekt-karte:hover,
+.objekt-karte:focus-visible {
+  transform: translateY(-2px);
 }
 
 .objekt-karte h3 {
@@ -522,4 +532,103 @@ body {
   margin: 0;
   font-size: 13px;
   color: var(--text-schwach);
+}
+
+/* Objekt-Detailansicht */
+
+.verborgen { display: none !important; }
+
+.objekt-detail-bereich {
+  max-width: 680px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.detail-zurueck {
+  align-self: flex-start;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--akzent);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 8px 0;
+}
+
+.detail-kopf {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.detail-kopf h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.gekuerzt-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-schwach);
+  background: var(--oberflaeche);
+  border: 1px solid var(--rand);
+  padding: 4px 9px;
+  border-radius: 10px;
+  cursor: help;
+}
+
+.detail-abschnitt {
+  background: var(--oberflaeche);
+  border: 1px solid var(--rand);
+  border-radius: 16px;
+  box-shadow: var(--schatten);
+  padding: 18px 20px;
+}
+
+.detail-abschnitt h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-schwach);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.detail-abschnitt p {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.detail-liste {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.detail-abschnitt.offene-punkte {
+  border-color: color-mix(in srgb, #ff9500 45%, var(--rand));
+}
+
+.detail-abschnitt.offene-punkte h4 {
+  color: #ff9500;
+}
+
+.detail-lade-hinweis {
+  text-align: center;
+  color: var(--text-schwach);
+  font-size: 14px;
+  padding: 40px 24px;
 }

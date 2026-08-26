@@ -308,8 +308,8 @@ function feldZusammenfassen(zeilen, feldKey) {
   return { wert: ausgewaehlt.wert, widerspruch, alleWerte: werte };
 }
 
-function objektKarteRendern(objektName, zeilen) {
-  const felderHtml = FELDER.map((feld) => {
+function kennzahlenFelderHtml(zeilen) {
+  return FELDER.map((feld) => {
     const ergebnis = feldZusammenfassen(zeilen, feld.key);
     if (!ergebnis) return "";
     const titel = ergebnis.widerspruch
@@ -323,14 +323,18 @@ function objektKarteRendern(objektName, zeilen) {
         </span>
       </div>`;
   }).join("");
+}
+
+function objektKarteRendern(objektName, zeilen) {
+  const felderHtml = kennzahlenFelderHtml(zeilen);
 
   return `
-    <div class="objekt-karte">
+    <button class="objekt-karte" data-objekt="${escapeHtml(objektName)}" type="button">
       <h3>${escapeHtml(objektName)}</h3>
       <div class="kennzahlen-liste">
         ${felderHtml || '<p class="keine-daten">Keine Kennzahlen extrahiert.</p>'}
       </div>
-    </div>`;
+    </button>`;
 }
 
 async function objekteUebersichtLaden() {
@@ -358,3 +362,95 @@ async function objekteUebersichtLaden() {
 }
 
 objekteUebersichtLaden();
+
+// --- Objekt-Detailansicht ---
+
+const objektDetailBereich = document.getElementById("objekt-detail-bereich");
+
+function listeAbschnitt(titel, punkte, klasse = "") {
+  if (!punkte || punkte.length === 0) return "";
+  return `
+    <div class="detail-abschnitt ${klasse}">
+      <h4>${escapeHtml(titel)}</h4>
+      <ul class="detail-liste">
+        ${punkte.map((p) => `<li>${escapeHtml(p)}</li>`).join("")}
+      </ul>
+    </div>`;
+}
+
+async function objektDetailAnzeigen(objektName) {
+  objekteListeBereich.classList.add("verborgen");
+  objektDetailBereich.classList.remove("verborgen");
+  objektDetailBereich.innerHTML = `
+    <button class="detail-zurueck" type="button">← Zurück zur Übersicht</button>
+    <p class="detail-lade-hinweis">Lade Zusammenfassung …</p>`;
+
+  let zusammenfassungHtml = "";
+  try {
+    const response = await fetch(`/api/zusammenfassung/${encodeURIComponent(objektName)}`);
+    if (response.status === 404) {
+      zusammenfassungHtml = `
+        <div class="detail-abschnitt">
+          <p>Für dieses Objekt liegt noch keine Zusammenfassung vor — sie wird
+          nach dem nächsten Dokumenten-Upload für dieses Objekt automatisch
+          erstellt.</p>
+        </div>`;
+    } else if (!response.ok) {
+      throw new Error(`Server-Fehler (${response.status})`);
+    } else {
+      const z = await response.json();
+      const gekuerztBadge = z.text_gekuerzt
+        ? `<span class="gekuerzt-badge" title="Das Objekt hat sehr viele Dokumente — die Zusammenfassung basiert nur auf einem Teil davon.">Teilweise erfasst</span>`
+        : "";
+      zusammenfassungHtml = `
+        <div class="detail-kopf">
+          <h2>${escapeHtml(objektName)}</h2>
+          ${gekuerztBadge}
+        </div>
+        <div class="detail-abschnitt">
+          <h4>Überblick</h4>
+          <p>${escapeHtml(z.kurzueberblick)}</p>
+        </div>
+        ${listeAbschnitt("Eckdaten", z.eckdaten)}
+        ${listeAbschnitt("Besonderheiten", z.besonderheiten)}
+        ${listeAbschnitt("Offene Punkte & Widersprüche", z.offene_punkte, "offene-punkte")}`;
+    }
+  } catch (fehler) {
+    zusammenfassungHtml = `<div class="detail-abschnitt"><p>Zusammenfassung konnte nicht geladen werden.</p></div>`;
+  }
+
+  let kennzahlenHtml = "";
+  try {
+    const response = await fetch(`/api/kennzahlen/${encodeURIComponent(objektName)}`);
+    const zeilen = await response.json();
+    const felderHtml = kennzahlenFelderHtml(zeilen);
+    if (felderHtml) {
+      kennzahlenHtml = `
+        <div class="detail-abschnitt">
+          <h4>Kennzahlen (je Dokument geprüft)</h4>
+          <div class="kennzahlen-liste">${felderHtml}</div>
+        </div>`;
+    }
+  } catch (fehler) {
+    // Kennzahlen sind eine Zusatzinfo unterhalb der Zusammenfassung -- bei
+    // einem Fehler hier einfach weglassen, die Zusammenfassung bleibt sichtbar.
+  }
+
+  objektDetailBereich.innerHTML = `
+    <button class="detail-zurueck" type="button">← Zurück zur Übersicht</button>
+    ${zusammenfassungHtml}
+    ${kennzahlenHtml}`;
+}
+
+objekteListeBereich.addEventListener("click", (ereignis) => {
+  const karte = ereignis.target.closest(".objekt-karte");
+  if (!karte) return;
+  objektDetailAnzeigen(karte.dataset.objekt);
+});
+
+objektDetailBereich.addEventListener("click", (ereignis) => {
+  if (!ereignis.target.closest(".detail-zurueck")) return;
+  objektDetailBereich.classList.add("verborgen");
+  objektDetailBereich.innerHTML = "";
+  objekteListeBereich.classList.remove("verborgen");
+});
