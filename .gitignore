@@ -1,4 +1,5 @@
 .env
+.env.prod
 data_pdf_real/
 storage/
 __pycache__/
